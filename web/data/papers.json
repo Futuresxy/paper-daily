@@ -1,7 +1,7 @@
 {
-  "generated_at": "Thu, 28 May 2026 12:14:03 +0000",
-  "generated_at_iso": "2026-05-28T12:14:03.183292+00:00",
-  "config_source": "issue",
+  "generated_at": "Thu, 28 May 2026 13:05:59 +0000",
+  "generated_at_iso": "2026-05-28T13:05:59.065945+00:00",
+  "config_source": "file",
   "topics": [
     {
       "id": "llm_low_precision_quantization",
@@ -127,13 +127,13 @@
         {
           "topic_id": "llm_low_precision_quantization",
           "topic_name": "大模型低精度量化",
-          "score": 0.353,
+          "score": 0.653,
           "level": "high",
           "reason": "关键词命中：post-training quantization；arXiv 分类重合：cs.LG",
           "keyword_hits": [
             "post-training quantization"
           ],
-          "llm_reason": "研究方向关注大语言模型低精度量化，本文聚焦于包含大语言模型骨干的VLA模型，提出统一的后训练量化方法，实现了权重量化与激活量化的W4A4，并解决异常值和动态范围问题，与研究方向中的低比特量化、后训练量化、权重量化、激活量化等关键词高度吻合。"
+          "llm_reason": "论文聚焦大模型后训练量化，涉及低比特权重量化和激活量化（W4A4），且关注量化对推理精度和内存占用影响，与我的研究方向高度一致。"
         },
         {
           "topic_id": "tensor_compute_unit_architecture",
@@ -163,24 +163,24 @@
       "best_match": {
         "topic_id": "llm_low_precision_quantization",
         "topic_name": "大模型低精度量化",
-        "score": 0.353,
+        "score": 0.653,
         "level": "high",
         "reason": "关键词命中：post-training quantization；arXiv 分类重合：cs.LG",
         "keyword_hits": [
           "post-training quantization"
         ],
-        "llm_reason": "研究方向关注大语言模型低精度量化，本文聚焦于包含大语言模型骨干的VLA模型，提出统一的后训练量化方法，实现了权重量化与激活量化的W4A4，并解决异常值和动态范围问题，与研究方向中的低比特量化、后训练量化、权重量化、激活量化等关键词高度吻合。"
+        "llm_reason": "论文聚焦大模型后训练量化，涉及低比特权重量化和激活量化（W4A4），且关注量化对推理精度和内存占用影响，与我的研究方向高度一致。"
       },
       "chinese_summary": {
-        "problem": "VLA模型参数规模大且包含扩散动作头，设备端部署困难，而现有量化方法无法统一压缩语言骨干与扩散头至低位宽，需要鲁棒的后训练量化方案。",
-        "method": "提出训练免的后训练量化框架Ω-QVLA，结合复合SVD-Hadamard旋转均衡权重能量并扩散异常值，以及针对扩散步的逐步激活缩放量化来吸收动态范围漂移。",
-        "innovation": "1) 首次实现VLA模型语言骨干与扩散动作头的统一W4A4后训练量化，无需混合精度；2) 提出复合SVD-Hadamard旋转，同时平滑权重通道能量和抑制激活异常值；3) 设计逐步激活缩放量化策略，有效应对扩散去噪过程中的动态范围变化。",
-        "evidence": "在LIBERO基准上，Pi 0.5和GR00T N1.5压缩至W4A4后任务成功率分别为98.0%和87.8%，匹配或超过FP16参考的97.1%和87.0%，静态内存减少71.3%；真实世界操纵实验证实平滑准确操作。",
-        "limitations": "仅限于特定的VLA模型（Pi 0.5和GR00T N1.5）和LIBERO任务，泛化性需验证；此外，未提及对推理延迟、吞吐量等性能指标的影响。",
-        "why_relevant": "研究方向关注大语言模型低精度量化，本文聚焦于包含大语言模型骨干的VLA模型，提出统一的后训练量化方法，实现了权重量化与激活量化的W4A4，并解决异常值和动态范围问题，与研究方向中的低比特量化、后训练量化、权重量化、激活量化等关键词高度吻合。"
+        "problem": "VLA模型因多语言骨干和扩散动作头导致设备端部署成本过高，现有量化方法仅压缩语言骨干或采用混合精度，未能统一量化扩散动作头，本工作挑战动作头均匀量化不稳定的假设。",
+        "method": "提出Ω-QVLA，首次无需训练的PTQ框架，通过复合SVD-Hadamard旋转平衡权重能量并扩散激活异常值，结合逐步DiT激活缩放量化吸收去噪步骤的动态范围漂移，将语言骨干和整个扩散动作头统一量化到W4A4。",
+        "innovation": "首次实现VLA模型中LLM骨干和DiT扩散动作头端到端统一W4A4量化，无需混合精度分配；提出复合SVD-Hadamard旋转解决权重能量不均衡和激活异常值；针对扩散动作头设计逐步DiT激活缩放量化，适应多步去噪的动态范围变化。",
+        "evidence": "在LIBERO上，压缩Pi 0.5和GR00T N1.5到W4A4，任务成功率分别为98.0%和87.8%，匹配或超过FP16参考的97.1%和87.0%；静态内存占用减少71.3%；真实世界操作实验确认平滑准确。",
+        "limitations": "摘要仅给出成功率，未提及时延或吞吐量等推理性能指标；未说明W4A4量化对模型精度影响的理论保证；泛化到其他VLA模型或任务需进一步验证。",
+        "why_relevant": "论文聚焦大模型后训练量化，涉及低比特权重量化和激活量化（W4A4），且关注量化对推理精度和内存占用影响，与我的研究方向高度一致。"
       },
       "first_seen_at": "2026-05-28T09:35:48.728882+00:00",
-      "last_seen_at": "2026-05-28T12:14:03.183292+00:00",
+      "last_seen_at": "2026-05-28T13:05:59.065945+00:00",
       "retained_from_previous_run": false
     },
     {
@@ -212,7 +212,7 @@
           "level": "low",
           "reason": "arXiv 分类重合：cs.LG",
           "keyword_hits": [],
-          "llm_reason": "论文专注于统计推断与优化，与作者研究的大模型推理集群通信优化（如并行策略、通信调度、系统吞吐优化）无直接关联，仅因arXiv分类cs.LG产生微弱匹配。"
+          "llm_reason": "与我的研究方向（大模型推理集群通信优化）无直接关联，仅因arXiv分类含cs.LG而自动匹配。"
         },
         {
           "topic_id": "llm_low_precision_quantization",
@@ -246,18 +246,18 @@
         "level": "low",
         "reason": "arXiv 分类重合：cs.LG",
         "keyword_hits": [],
-        "llm_reason": "论文专注于统计推断与优化，与作者研究的大模型推理集群通信优化（如并行策略、通信调度、系统吞吐优化）无直接关联，仅因arXiv分类cs.LG产生微弱匹配。"
+        "llm_reason": "与我的研究方向（大模型推理集群通信优化）无直接关联，仅因arXiv分类含cs.LG而自动匹配。"
       },
       "chinese_summary": {
-        "problem": "在随机块模型（SBM）中，如何实现高效的推断与模型选择，避免昂贵的网格搜索或启发式程序。",
-        "method": "将最大似然变分推断解释为半松弛Gromov-Wasserstein投影，并通过无正则化形式促进稀疏性以同时实现参数估计和聚类数量选择。",
-        "innovation": "揭示了最大似然变分推断与最优传输之间的内在联系；提出了无正则化的半松弛GW估计器，并证明了其渐近一致性；进一步引入稀疏性促进机制，在有限样本下实现自动模型选择，无需额外模型选择步骤。",
-        "evidence": "摘要提及理论证明：无正则化srGW估计器在渐近状态下可一致恢复SBM连接矩阵和潜在聚类分配；但未给出实验验证的具体指标或对比方法，仅提到“empirically show”，需查阅全文才能确认实证证据。",
-        "limitations": "仅针对随机块模型，应用领域较窄；有限样本下的稀疏性促进机制细节未在摘要中说明；实验证据不足，需阅读全文验证实际性能。",
-        "why_relevant": "论文专注于统计推断与优化，与作者研究的大模型推理集群通信优化（如并行策略、通信调度、系统吞吐优化）无直接关联，仅因arXiv分类cs.LG产生微弱匹配。"
+        "problem": "解决随机块模型(SBM)中推断与模型选择(即聚类数估计)的计算效率与准确性问题，避免网格搜索等启发式步骤。",
+        "method": "将最大似然变分推断解释为半松弛Gromov-Wasserstein投影，并提出非正则化srGW估计量，进一步引入稀疏性正则化以同时完成参数估计和聚类数选择。",
+        "innovation": "首次建立MLVI与srGW投影的联系；证明非正则化srGW估计量在渐近下可一致恢复SBM连接矩阵和隐聚类分配，但有限样本下需额外机制促进模型选择。",
+        "evidence": "摘要中声称实验显示正则化后的估计量可在单一优化问题中同时恢复模型参数并选择聚类数量，但未提供具体实验数据、数据集或对比基准。",
+        "limitations": "仅针对SBM模型，推广性存疑；正则化方法的具体形式与超参数影响未在摘要中明确；实际计算效率与传统方法的对比未知。",
+        "why_relevant": "与我的研究方向（大模型推理集群通信优化）无直接关联，仅因arXiv分类含cs.LG而自动匹配。"
       },
       "first_seen_at": "2026-05-28T09:35:48.728882+00:00",
-      "last_seen_at": "2026-05-28T12:14:03.183292+00:00",
+      "last_seen_at": "2026-05-28T13:05:59.065945+00:00",
       "retained_from_previous_run": false
     }
   ],
@@ -266,7 +266,7 @@
     "new_paper_count": 2,
     "days": 1,
     "collection_mode": "lookback",
-    "collection_cutoff_iso": "2026-05-27T12:14:03.183292+00:00",
+    "collection_cutoff_iso": "2026-05-27T13:05:59.065945+00:00",
     "max_per_topic": 25,
     "llm_enabled": true,
     "llm_concurrency": 2,
@@ -278,7 +278,7 @@
     "dropped_low_relevance_count": 0,
     "max_stored_papers": 800,
     "max_data_bytes": 8388608,
-    "data_bytes": 15222,
+    "data_bytes": 14473,
     "storage_trimmed_count": 0,
     "storage_trimmed_by_level": {
       "high": 0,
