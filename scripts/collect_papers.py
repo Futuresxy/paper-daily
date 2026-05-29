@@ -152,19 +152,24 @@ def arxiv_query_for_topic(topic: Topic) -> str:
 
 
 def arxiv_retry_wait_seconds(exc: Exception, attempt: int) -> float:
+    min_wait = float(os.getenv("ARXIV_RETRY_MIN_SECONDS", "45"))
     if isinstance(exc, urllib.error.HTTPError):
         retry_after = exc.headers.get("Retry-After")
         if retry_after and retry_after.isdigit():
-            return float(retry_after)
+            return max(min_wait, float(retry_after))
     base = float(os.getenv("ARXIV_RETRY_BASE_SECONDS", "45"))
     cap = float(os.getenv("ARXIV_RETRY_MAX_SECONDS", "180"))
-    return min(cap, base * (2**attempt))
+    return max(min_wait, min(cap, base * (2**attempt)))
 
 
 def is_retryable_arxiv_error(exc: Exception) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in TRANSIENT_HTTP_CODES
     return isinstance(exc, (TimeoutError, urllib.error.URLError, OSError))
+
+
+def should_stop_arxiv_fetches(exc: Exception) -> bool:
+    return isinstance(exc, urllib.error.HTTPError) and exc.code in {429, 503}
 
 
 def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
@@ -635,6 +640,15 @@ def collect(
         except Exception as exc:
             failed_fetches += 1
             print(f"Warning: arXiv request failed for {topic.name}: {exc}", file=sys.stderr)
+            if should_stop_arxiv_fetches(exc):
+                skipped = len(topics) - index - 1
+                failed_fetches += skipped
+                if skipped:
+                    print(
+                        f"Stopping arXiv fetches after {exc}; skipped {skipped} remaining topic(s) to avoid further throttling.",
+                        file=sys.stderr,
+                    )
+                break
 
     if failed_fetches == len(topics) and existing_payload:
         existing = existing_payload

@@ -31,10 +31,12 @@ def paper(paper_id: str, level: str, published: str) -> dict:
 
 class RetentionTest(unittest.TestCase):
     def tearDown(self) -> None:
+        os.environ.pop("ARXIV_RETRY_MIN_SECONDS", None)
         os.environ.pop("ARXIV_RETRY_BASE_SECONDS", None)
         os.environ.pop("ARXIV_RETRY_MAX_SECONDS", None)
 
     def test_arxiv_retry_wait_uses_retry_after_header(self) -> None:
+        os.environ["ARXIV_RETRY_MIN_SECONDS"] = "30"
         error = urllib.error.HTTPError(
             "https://export.arxiv.org/api/query",
             429,
@@ -45,7 +47,20 @@ class RetentionTest(unittest.TestCase):
 
         self.assertEqual(arxiv_retry_wait_seconds(error, 0), 75.0)
 
+    def test_arxiv_retry_wait_clamps_short_retry_after_header(self) -> None:
+        os.environ["ARXIV_RETRY_MIN_SECONDS"] = "30"
+        error = urllib.error.HTTPError(
+            "https://export.arxiv.org/api/query",
+            503,
+            "Service Unavailable",
+            {"Retry-After": "0"},
+            None,
+        )
+
+        self.assertEqual(arxiv_retry_wait_seconds(error, 0), 30.0)
+
     def test_arxiv_retry_wait_uses_capped_backoff(self) -> None:
+        os.environ["ARXIV_RETRY_MIN_SECONDS"] = "5"
         os.environ["ARXIV_RETRY_BASE_SECONDS"] = "10"
         os.environ["ARXIV_RETRY_MAX_SECONDS"] = "25"
 
