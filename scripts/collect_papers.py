@@ -42,7 +42,7 @@ DEFAULT_MAX_DATA_BYTES = 8 * 1024 * 1024
 DEFAULT_RECENT_HISTORY_DAYS = 45
 TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
 DBLP_TRANSIENT_HTTP_CODES = {429, 502, 503, 504}
-DEFAULT_SOURCE_TYPES = ["arxiv", "openalex", "crossref", "semantic_scholar"]
+DEFAULT_SOURCE_TYPES = ["arxiv", "openalex", "crossref"]
 FEED_NAMESPACES = {"atom": "http://www.w3.org/2005/Atom"}
 
 
@@ -106,6 +106,16 @@ def env_list(name: str, default: list[str]) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def parse_topics(config: dict[str, Any]) -> list[Topic]:
     topics = []
     for item in config.get("topics", []):
@@ -137,6 +147,11 @@ def parse_sources(config: dict[str, Any]) -> list[SourceConfig]:
             continue
         source_type = str(item.get("type") or "").strip().lower()
         if not source_type:
+            continue
+        if (
+            source_type in {"semantic_scholar", "semanticscholar", "semantic-scholar"}
+            and not env_flag("ENABLE_SEMANTIC_SCHOLAR", False)
+        ):
             continue
         if item.get("enabled", True) is False:
             continue
@@ -310,7 +325,14 @@ def arxiv_query_for_topic(topic: Topic) -> str:
         keyword_terms.append(f'all:"{escaped}"')
 
     category_terms = [f"cat:{category}" for category in topic.arxiv_categories[:5]]
-    query_mode = os.getenv("ARXIV_QUERY_MODE", "broad").strip().lower()
+    query_mode = os.getenv("ARXIV_QUERY_MODE", "keyword").strip().lower()
+    if query_mode == "keyword":
+        if keyword_terms:
+            return "(" + " OR ".join(keyword_terms) + ")"
+        if category_terms:
+            return "(" + " OR ".join(category_terms) + ")"
+        return f'all:"{topic.name}"'
+
     if query_mode == "strict":
         parts = []
         if keyword_terms:
@@ -503,10 +525,11 @@ def fetch_arxiv_query(search_query: str, max_results: int, sort_by: str, sort_or
 
 
 def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
+    sort_by = os.getenv("ARXIV_SORT_BY", "lastUpdatedDate").strip() or "lastUpdatedDate"
     papers = fetch_arxiv_query(
         arxiv_query_for_topic(topic),
         max_results,
-        sort_by="submittedDate",
+        sort_by=sort_by,
         sort_order="descending",
         label=topic.name,
     )
@@ -518,7 +541,7 @@ def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
         category_papers = fetch_arxiv_query(
             arxiv_category_query_for_topic(topic),
             category_max_results,
-            sort_by="submittedDate",
+            sort_by=sort_by,
             sort_order="descending",
             label=f"{topic.name} categories",
         )
@@ -724,7 +747,7 @@ def find_conference_abstract_by_title(title: str, max_results: int = 5) -> dict[
         "openalex": find_openalex_by_title,
         "crossref": find_crossref_by_title,
     }
-    for source_type in env_list("CONFERENCE_ABSTRACT_SOURCES", ["arxiv", "openalex", "semantic_scholar", "crossref"]):
+    for source_type in conference_abstract_sources():
         finder = finders.get(source_type.strip().lower())
         if not finder:
             continue
@@ -736,6 +759,17 @@ def find_conference_abstract_by_title(title: str, max_results: int = 5) -> dict[
         if candidate and has_meaningful_summary(candidate):
             return candidate
     return None
+
+
+def conference_abstract_sources() -> list[str]:
+    sources = env_list("CONFERENCE_ABSTRACT_SOURCES", ["arxiv", "openalex", "crossref"])
+    if env_flag("ENABLE_SEMANTIC_SCHOLAR", False):
+        return sources
+    return [
+        source
+        for source in sources
+        if source.strip().lower() not in {"semantic_scholar", "semanticscholar", "semantic-scholar"}
+    ]
 
 
 def enrich_conference_paper_from_arxiv(paper: dict[str, Any], arxiv_paper: dict[str, Any]) -> bool:
@@ -1326,6 +1360,14 @@ def paper_datetime(paper: dict[str, Any]) -> dt.datetime:
     return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
 
 
+def paper_activity_datetime(paper: dict[str, Any]) -> dt.datetime:
+    for field in ("updated", "published", "last_seen_at", "first_seen_at"):
+        parsed = parse_datetime(str(paper.get(field, "")))
+        if parsed:
+            return parsed
+    return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -1454,10 +1496,7 @@ def enrich_conference_papers_from_arxiv(papers: list[dict[str, Any]]) -> dict[st
         1,
         int(os.getenv("CONFERENCE_ABSTRACT_SEARCH_RESULTS", os.getenv("CONFERENCE_ARXIV_SEARCH_RESULTS", "5"))),
     )
-    abstract_sources = env_list(
-        "CONFERENCE_ABSTRACT_SOURCES",
-        ["arxiv", "openalex", "semantic_scholar", "crossref"],
-    )
+    abstract_sources = conference_abstract_sources()
     arxiv_enrichment_enabled = "arxiv" in {source.strip().lower() for source in abstract_sources}
     stats: dict[str, Any] = {
         "conference_abstract_enrichment_attempted": 0,
@@ -2016,26 +2055,64 @@ def collect(
         print("All configured sources failed; preserving existing paper data.", file=sys.stderr)
 
     recent_papers = []
+    daily_backfill_candidates = []
     filtered_low_relevance = 0
+    raw_daily_candidate_count = 0
+    daily_outside_cutoff_count = 0
+    backfill_days = max(days, env_int("DAILY_BACKFILL_DAYS", 14))
+    daily_backfill_cutoff = now - dt.timedelta(days=max(0, backfill_days))
     for paper in dedupe_papers(all_candidates):
         is_conference_paper = paper.get("source_type") == "conference"
-        published = paper.get("published") or paper.get("updated")
-        published_at = parse_datetime(str(published)) if published else None
-        if is_conference_paper or (published_at and published_at >= cutoff):
-            matches = [score_paper(topic, paper) for topic in topics]
-            matches.sort(key=lambda item: item["score"], reverse=True)
-            best_match = matches[0]
-            if not is_relevant_enough(paper, best_match):
-                filtered_low_relevance += 1
-                continue
-            paper["matches"] = matches
-            paper["best_match"] = best_match
+        if not is_conference_paper:
+            raw_daily_candidate_count += 1
+        activity_at = paper_activity_datetime(paper)
+        in_primary_window = is_conference_paper or activity_at >= cutoff
+        in_backfill_window = (
+            not is_conference_paper
+            and not in_primary_window
+            and activity_at >= daily_backfill_cutoff
+        )
+        if not in_primary_window and not in_backfill_window:
+            if not is_conference_paper:
+                daily_outside_cutoff_count += 1
+            continue
+
+        matches = [score_paper(topic, paper) for topic in topics]
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        best_match = matches[0]
+        if not is_relevant_enough(paper, best_match):
+            filtered_low_relevance += 1
+            continue
+        paper["matches"] = matches
+        paper["best_match"] = best_match
+        if in_backfill_window:
+            paper["backfilled_from_recent_arxiv"] = True
+            daily_outside_cutoff_count += 1
+            daily_backfill_candidates.append(paper)
+        else:
             recent_papers.append(paper)
 
-    recent_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+    recent_papers.sort(key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)), reverse=True)
     daily_recent_papers = [paper for paper in recent_papers if paper.get("source_type") != "conference"]
     conference_recent_papers = [paper for paper in recent_papers if paper.get("source_type") == "conference"]
-    candidate_paper_count = len(recent_papers)
+    daily_backfill_added_count = 0
+    min_daily_papers = max(0, env_int("MIN_DAILY_PAPERS", 8))
+    if len(daily_recent_papers) < min_daily_papers and daily_backfill_candidates:
+        daily_backfill_candidates.sort(
+            key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)),
+            reverse=True,
+        )
+        existing_daily_ids = {str(paper.get("id", "")) for paper in daily_recent_papers}
+        for paper in daily_backfill_candidates:
+            if len(daily_recent_papers) >= min_daily_papers:
+                break
+            paper_id = str(paper.get("id", ""))
+            if paper_id in existing_daily_ids:
+                continue
+            existing_daily_ids.add(paper_id)
+            daily_recent_papers.append(paper)
+            daily_backfill_added_count += 1
+    candidate_paper_count = len(daily_recent_papers) + len(conference_recent_papers)
     daily_candidate_paper_count = len(daily_recent_papers)
     conference_candidate_paper_count = len(conference_recent_papers)
     if max_new_papers > 0:
@@ -2052,7 +2129,7 @@ def collect(
         conference_recent_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
     recent_papers = sorted(
         [*daily_recent_papers, *conference_recent_papers],
-        key=lambda p: (p["best_match"]["score"], p.get("published", "")),
+        key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)),
         reverse=True,
     )
     summaries_by_id: dict[str, tuple[dict[str, str], dict[str, Any]]] = {}
@@ -2099,13 +2176,19 @@ def collect(
         recent_history_days,
         active_conference_years_by_source,
     )
-    daily_merged_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
-    conference_merged_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+    daily_merged_papers.sort(key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)), reverse=True)
+    conference_merged_papers.sort(key=lambda p: (p["best_match"]["score"], paper_activity_datetime(p)), reverse=True)
 
     base_stats = {
         "candidate_paper_count": candidate_paper_count,
         "daily_candidate_paper_count": daily_candidate_paper_count,
         "conference_candidate_paper_count": conference_candidate_paper_count,
+        "raw_daily_candidate_count": raw_daily_candidate_count,
+        "daily_outside_cutoff_count": daily_outside_cutoff_count,
+        "daily_backfill_days": backfill_days,
+        "daily_backfill_candidate_count": len(daily_backfill_candidates),
+        "daily_backfill_added_count": daily_backfill_added_count,
+        "min_daily_papers": min_daily_papers,
         "filtered_low_relevance_count": filtered_low_relevance,
         "days": days,
         "collection_mode": collection_mode,
@@ -2222,6 +2305,14 @@ def main() -> None:
         args.clear_cache,
     )
     print(f"Wrote {len(payload['papers'])} daily papers to {args.output}")
+    stats = payload.get("stats", {})
+    print(
+        "Daily arXiv stats: "
+        f"raw={stats.get('raw_daily_candidate_count', 0)}, "
+        f"selected={stats.get('daily_candidate_paper_count', 0)}, "
+        f"backfilled={stats.get('daily_backfill_added_count', 0)}, "
+        f"filtered={stats.get('filtered_low_relevance_count', 0)}"
+    )
     if args.conference_output.exists():
         conference_payload = load_json(args.conference_output)
         print(f"Wrote {len(conference_payload.get('papers', []))} conference papers to {args.conference_output}")

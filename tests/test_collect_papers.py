@@ -1,7 +1,10 @@
 import datetime as dt
+import json
 import os
+import tempfile
 import urllib.error
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from scripts.collect_papers import (
@@ -9,7 +12,9 @@ from scripts.collect_papers import (
     arxiv_query_for_topic,
     arxiv_retry_wait_seconds,
     cached_conference_years,
+    collect,
     collection_cutoff,
+    conference_abstract_sources,
     default_conference_years,
     enrich_conference_paper_from_arxiv,
     fetch_arxiv,
@@ -71,7 +76,10 @@ class RetentionTest(unittest.TestCase):
         os.environ.pop("MIN_TITLE_ONLY_SCORE", None)
         os.environ.pop("MIN_PAPER_SCORE", None)
         os.environ.pop("CONFERENCE_ABSTRACT_SOURCES", None)
+        os.environ.pop("ENABLE_SEMANTIC_SCHOLAR", None)
         os.environ.pop("ARXIV_QUERY_MODE", None)
+        os.environ.pop("MIN_DAILY_PAPERS", None)
+        os.environ.pop("DAILY_BACKFILL_DAYS", None)
 
     def test_arxiv_retry_wait_uses_retry_after_header(self) -> None:
         os.environ["ARXIV_RETRY_MIN_SECONDS"] = "30"
@@ -183,6 +191,16 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(sources[1].url, "https://example.com/rss.xml")
         self.assertEqual(sources[1].headers_env, "CUSTOM_FEED_HEADERS")
 
+    def test_semantic_scholar_sources_are_opt_in(self) -> None:
+        sources = parse_sources({"sources": ["arxiv", "semantic_scholar"]})
+
+        self.assertEqual([source.type for source in sources], ["arxiv"])
+
+        os.environ["ENABLE_SEMANTIC_SCHOLAR"] = "true"
+        sources = parse_sources({"sources": ["arxiv", "semantic_scholar"]})
+
+        self.assertEqual([source.type for source in sources], ["arxiv", "semantic_scholar"])
+
     def test_source_request_headers_reads_secret_envs(self) -> None:
         os.environ["CUSTOM_FEED_HEADERS"] = '{"X-API-Key": "secret"}'
         os.environ["CUSTOM_FEED_BEARER_TOKEN"] = "token"
@@ -228,7 +246,23 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(papers[0]["authors"], ["Ada Example"])
         self.assertEqual(papers[0]["categories"], ["cs.AR"])
 
-    def test_arxiv_query_defaults_to_broad_single_request(self) -> None:
+    def test_arxiv_query_defaults_to_keyword_search(self) -> None:
+        topic = Topic(
+            id="llm",
+            name="LLM inference",
+            description="",
+            keywords=["LLM inference"],
+            arxiv_categories=["cs.CL", "cs.LG"],
+        )
+
+        query = arxiv_query_for_topic(topic)
+
+        self.assertIn('all:"LLM inference"', query)
+        self.assertNotIn("cat:cs.CL", query)
+        self.assertNotIn(" AND ", query)
+
+    def test_arxiv_query_can_use_broad_mode(self) -> None:
+        os.environ["ARXIV_QUERY_MODE"] = "broad"
         topic = Topic(
             id="llm",
             name="LLM inference",
@@ -376,6 +410,7 @@ class RetentionTest(unittest.TestCase):
             "categories": [],
         }
         os.environ["CONFERENCE_ABSTRACT_SOURCES"] = "arxiv,semantic_scholar"
+        os.environ["ENABLE_SEMANTIC_SCHOLAR"] = "true"
 
         with (
             mock.patch("scripts.collect_papers.find_arxiv_by_title", side_effect=TimeoutError("slow")),
@@ -384,6 +419,33 @@ class RetentionTest(unittest.TestCase):
             candidate = find_conference_abstract_by_title("Fast Tensor Compute")
 
         self.assertEqual(candidate, semantic_candidate)
+
+    def test_conference_abstract_sources_skip_semantic_by_default(self) -> None:
+        os.environ["CONFERENCE_ABSTRACT_SOURCES"] = "arxiv,semantic_scholar,crossref"
+
+        self.assertEqual(conference_abstract_sources(), ["arxiv", "crossref"])
+
+    def test_conference_abstract_finder_does_not_call_semantic_unless_enabled(self) -> None:
+        crossref_candidate = {
+            "id": "doi:abc",
+            "source": "Crossref",
+            "title": "Fast Tensor Compute",
+            "summary": "This paper presents a detailed architecture for tensor compute in LLM serving systems. " * 2,
+            "paper_url": "https://doi.org/example",
+            "pdf_url": "",
+            "authors": [],
+            "categories": [],
+        }
+        os.environ["CONFERENCE_ABSTRACT_SOURCES"] = "semantic_scholar,crossref"
+
+        with (
+            mock.patch("scripts.collect_papers.find_semantic_scholar_by_title") as semantic_mock,
+            mock.patch("scripts.collect_papers.find_crossref_by_title", return_value=crossref_candidate),
+        ):
+            candidate = find_conference_abstract_by_title("Fast Tensor Compute")
+
+        semantic_mock.assert_not_called()
+        self.assertEqual(candidate, crossref_candidate)
 
     def test_relevance_filter_rejects_weak_title_only_and_conference_matches(self) -> None:
         weak_title = {"title": "A Generic Optimization Study", "summary": ""}
@@ -678,6 +740,69 @@ class RetentionTest(unittest.TestCase):
         self.assertEqual(papers[0]["title"], "Fast ACS: Low-Latency File-Based Ordered Message Delivery at Scale")
         self.assertEqual(papers[0]["authors"], ["Sushant Kumar Gupta", "Anil Raghunath Iyer"])
         self.assertEqual(papers[0]["pdf_url"], "https://www.usenix.org/conference/atc25/presentation/gupta")
+
+    def test_collect_backfills_recent_arxiv_when_daily_window_is_empty(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        recent_but_not_today = (now - dt.timedelta(days=3)).isoformat()
+        config = {
+            "sources": [{"type": "arxiv", "name": "arXiv"}],
+            "conference_sources": {"enabled": False},
+            "topics": [
+                {
+                    "id": "tensor",
+                    "name": "Tensor Compute",
+                    "description": "tensor core architecture for LLM inference",
+                    "keywords": ["tensor core", "LLM inference"],
+                    "arxiv_categories": ["cs.AR"],
+                }
+            ],
+        }
+        fetched_paper = {
+            "id": "2601.00001v1",
+            "source": "arXiv",
+            "title": "Fast Tensor Core Architecture for LLM Inference",
+            "authors": ["Ada Example"],
+            "summary": "This paper presents a tensor core architecture for efficient LLM inference. " * 3,
+            "published": recent_but_not_today,
+            "updated": recent_but_not_today,
+            "paper_url": "https://arxiv.org/abs/2601.00001v1",
+            "pdf_url": "https://arxiv.org/pdf/2601.00001v1",
+            "categories": ["cs.AR"],
+        }
+
+        os.environ["MIN_DAILY_PAPERS"] = "1"
+        os.environ["DAILY_BACKFILL_DAYS"] = "14"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / "interests.json"
+            output_path = tmp_path / "papers.json"
+            conference_output_path = tmp_path / "conference.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            with (
+                mock.patch("scripts.collect_papers.fetch_source_topic", return_value=[fetched_paper]),
+                mock.patch("scripts.collect_papers.time.sleep"),
+            ):
+                payload = collect(
+                    config_path,
+                    output_path,
+                    conference_output_path,
+                    days=1,
+                    max_per_topic=1,
+                    max_summaries=0,
+                    max_new_papers=10,
+                    max_stored_papers=10,
+                    max_new_conference_papers=10,
+                    max_stored_conference_papers=10,
+                    max_data_bytes=0,
+                    incremental_since_last_run=False,
+                    recent_history_days=45,
+                    clear_cache=True,
+                )
+
+        self.assertEqual(payload["stats"]["daily_candidate_paper_count"], 1)
+        self.assertEqual(payload["stats"]["daily_backfill_added_count"], 1)
+        self.assertTrue(payload["papers"][0]["backfilled_from_recent_arxiv"])
 
 
 if __name__ == "__main__":
