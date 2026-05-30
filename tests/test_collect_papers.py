@@ -2,16 +2,20 @@ import datetime as dt
 import os
 import urllib.error
 import unittest
+from unittest import mock
 
 from scripts.collect_papers import (
     arxiv_retry_wait_seconds,
     collection_cutoff,
+    fetch_arxiv,
     is_retryable_arxiv_error,
     merge_with_retained_papers,
     openalex_abstract_text,
     parse_sources,
+    should_retry_arxiv_error,
     source_request_headers,
     SourceConfig,
+    Topic,
     trim_papers_for_storage,
 )
 
@@ -38,6 +42,7 @@ class RetentionTest(unittest.TestCase):
         os.environ.pop("ARXIV_RETRY_MIN_SECONDS", None)
         os.environ.pop("ARXIV_RETRY_BASE_SECONDS", None)
         os.environ.pop("ARXIV_RETRY_MAX_SECONDS", None)
+        os.environ.pop("ARXIV_RETRY_THROTTLED", None)
         os.environ.pop("CUSTOM_FEED_HEADERS", None)
         os.environ.pop("CUSTOM_FEED_BEARER_TOKEN", None)
 
@@ -80,6 +85,48 @@ class RetentionTest(unittest.TestCase):
         self.assertTrue(is_retryable_arxiv_error(rate_limited))
         self.assertTrue(is_retryable_arxiv_error(TimeoutError("timed out")))
         self.assertFalse(is_retryable_arxiv_error(not_found))
+
+    def test_arxiv_retry_policy_fast_fails_throttling_by_default(self) -> None:
+        rate_limited = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, None)
+        service_unavailable = urllib.error.HTTPError("url", 503, "Service Unavailable", {}, None)
+        gateway_error = urllib.error.HTTPError("url", 502, "Bad Gateway", {}, None)
+
+        self.assertFalse(should_retry_arxiv_error(rate_limited))
+        self.assertFalse(should_retry_arxiv_error(service_unavailable))
+        self.assertTrue(should_retry_arxiv_error(gateway_error))
+
+    def test_arxiv_retry_policy_can_retry_throttling_when_enabled(self) -> None:
+        os.environ["ARXIV_RETRY_THROTTLED"] = "true"
+        rate_limited = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, None)
+        service_unavailable = urllib.error.HTTPError("url", 503, "Service Unavailable", {}, None)
+
+        self.assertTrue(should_retry_arxiv_error(rate_limited))
+        self.assertTrue(should_retry_arxiv_error(service_unavailable))
+
+    def test_fetch_arxiv_does_not_sleep_on_service_unavailable_by_default(self) -> None:
+        topic = Topic(
+            id="llm_quant",
+            name="LLM quantization",
+            description="",
+            keywords=["LLM quantization"],
+            arxiv_categories=["cs.CL"],
+        )
+        service_unavailable = urllib.error.HTTPError(
+            "https://export.arxiv.org/api/query",
+            503,
+            "Service Unavailable",
+            {},
+            None,
+        )
+
+        with (
+            mock.patch("scripts.collect_papers.urllib.request.urlopen", side_effect=service_unavailable),
+            mock.patch("scripts.collect_papers.time.sleep") as sleep_mock,
+        ):
+            with self.assertRaises(urllib.error.HTTPError):
+                fetch_arxiv(topic, 1)
+
+        sleep_mock.assert_not_called()
 
     def test_parse_sources_supports_custom_feed(self) -> None:
         sources = parse_sources(

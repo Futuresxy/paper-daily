@@ -282,6 +282,14 @@ def is_retryable_arxiv_error(exc: Exception) -> bool:
     return isinstance(exc, (TimeoutError, urllib.error.URLError, OSError))
 
 
+def should_retry_arxiv_error(exc: Exception) -> bool:
+    if not is_retryable_arxiv_error(exc):
+        return False
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in {429, 503}:
+        return env_flag("ARXIV_RETRY_THROTTLED", False)
+    return True
+
+
 def should_stop_arxiv_fetches(exc: Exception) -> bool:
     return isinstance(exc, urllib.error.HTTPError) and exc.code in {429, 503}
 
@@ -295,7 +303,7 @@ def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
         "sortOrder": "descending",
     }
     url = f"{ARXIV_API_URL}?{urllib.parse.urlencode(params)}"
-    retry_count = int(os.getenv("ARXIV_RETRIES", "4"))
+    retry_count = max(1, int(os.getenv("ARXIV_RETRIES", "4")))
     timeout_seconds = float(os.getenv("ARXIV_TIMEOUT_SECONDS", "90"))
     last_error: Exception | None = None
     for attempt in range(retry_count):
@@ -306,7 +314,7 @@ def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
             break
         except Exception as exc:
             last_error = exc
-            if not is_retryable_arxiv_error(exc) or attempt == retry_count - 1:
+            if not should_retry_arxiv_error(exc) or attempt == retry_count - 1:
                 raise
             wait_seconds = arxiv_retry_wait_seconds(exc, attempt)
             if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
