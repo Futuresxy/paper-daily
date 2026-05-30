@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Daily</title>
-    <link rel="stylesheet" href="./styles.css?v=20260529-theme-ui" />
+    <link rel="stylesheet" href="./styles.css?v=20260530-split-sources" />
   </head>
   <body>
     <header class="topbar">
@@ -62,7 +62,12 @@
       </section>
 
       <section class="toolbar" aria-label="筛选">
+        <div class="collection-tabs" role="tablist" aria-label="论文集合">
+          <button class="collection-tab active" type="button" data-collection="daily">每日新论文</button>
+          <button class="collection-tab" type="button" data-collection="conference">顶会精品</button>
+        </div>
         <div class="tabs" role="tablist" aria-label="视图">
+          <button class="tab" type="button" data-view="all">全部</button>
           <button class="tab active" type="button" data-view="daily">当日</button>
           <button class="tab" type="button" data-view="week">本周</button>
           <button class="tab" type="button" data-view="month">本月</button>
@@ -146,6 +151,6 @@
       </article>
     </template>
 
-    <script src="./app.js?v=20260529-theme-ui"></script>
+    <script src="./app.js?v=20260530-split-sources"></script>
   </body>
 </html>

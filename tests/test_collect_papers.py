@@ -10,6 +10,7 @@ from scripts.collect_papers import (
     cached_conference_years,
     collection_cutoff,
     default_conference_years,
+    enrich_conference_paper_from_arxiv,
     fetch_arxiv,
     is_relevant_enough,
     is_retryable_dblp_error,
@@ -17,14 +18,17 @@ from scripts.collect_papers import (
     merge_with_retained_papers,
     merge_config,
     openalex_abstract_text,
+    parse_arxiv_entries,
     parse_conference_sources,
     parse_dblp_html_toc,
     parse_dblp_hits,
     parse_sources,
     should_retry_arxiv_error,
     should_summarize_paper_with_llm,
+    split_conference_payload,
     source_request_headers,
     SourceConfig,
+    titles_match,
     Topic,
     trim_papers_for_storage,
     uncached_conference_years,
@@ -194,6 +198,57 @@ class RetentionTest(unittest.TestCase):
 
         self.assertEqual(abstract, "hello world")
 
+    def test_parse_arxiv_entries_reuses_atom_parser(self) -> None:
+        xml = b"""
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <id>https://arxiv.org/abs/2601.00001</id>
+            <title>Fast Tensor Compute for LLM Serving</title>
+            <summary>This paper studies efficient tensor compute for large language model serving systems.</summary>
+            <published>2026-01-01T00:00:00Z</published>
+            <updated>2026-01-02T00:00:00Z</updated>
+            <author><name>Ada Example</name></author>
+            <category term="cs.AR" />
+            <link title="pdf" href="https://arxiv.org/pdf/2601.00001" />
+          </entry>
+        </feed>
+        """
+
+        papers = parse_arxiv_entries(xml, seed_topic="arch")
+
+        self.assertEqual(papers[0]["id"], "2601.00001")
+        self.assertEqual(papers[0]["seed_topic"], "arch")
+        self.assertEqual(papers[0]["authors"], ["Ada Example"])
+        self.assertEqual(papers[0]["categories"], ["cs.AR"])
+
+    def test_title_matching_allows_punctuation_differences(self) -> None:
+        self.assertTrue(titles_match("Fast Tensor Compute: An LLM Serving Study.", "Fast Tensor Compute - An LLM Serving Study"))
+        self.assertFalse(titles_match("Fast Tensor Compute", "Database Indexing for Cloud Storage"))
+
+    def test_enrich_conference_paper_from_arxiv_copies_abstract_and_links(self) -> None:
+        conference = {
+            "id": "dblp:conf/isca/example",
+            "source": "DBLP · ISCA",
+            "source_type": "conference",
+            "title": "Fast Tensor Compute",
+            "summary": "DBLP 题录：ISCA 2026 会议论文。",
+            "categories": ["ISCA"],
+        }
+        arxiv = {
+            "id": "2601.00001",
+            "title": "Fast Tensor Compute",
+            "summary": "This paper presents a detailed architecture for tensor compute in LLM serving systems. " * 2,
+            "paper_url": "https://arxiv.org/abs/2601.00001",
+            "pdf_url": "https://arxiv.org/pdf/2601.00001",
+            "authors": ["Ada Example"],
+            "categories": ["cs.AR"],
+        }
+
+        self.assertTrue(enrich_conference_paper_from_arxiv(conference, arxiv))
+        self.assertEqual(conference["abstract_source"], "arXiv")
+        self.assertEqual(conference["paper_url"], "https://arxiv.org/abs/2601.00001")
+        self.assertIn("cs.AR", conference["categories"])
+
     def test_relevance_filter_rejects_weak_title_only_and_conference_matches(self) -> None:
         weak_title = {"title": "A Generic Optimization Study", "summary": ""}
         weak_conference = {
@@ -215,6 +270,7 @@ class RetentionTest(unittest.TestCase):
         self.assertFalse(should_summarize_paper_with_llm({"source_type": "conference", "summary": "DBLP 题录。"}))
         self.assertFalse(should_summarize_paper_with_llm({"source": "Crossref", "summary": ""}))
         self.assertTrue(should_summarize_paper_with_llm({"source": "arXiv", "summary": "x" * 100}))
+        self.assertTrue(should_summarize_paper_with_llm({"source_type": "conference", "summary": "x" * 100}))
 
         os.environ["LLM_SUMMARIZE_CONFERENCE"] = "true"
         os.environ["LLM_SUMMARIZE_TITLE_ONLY"] = "true"
@@ -311,6 +367,20 @@ class RetentionTest(unittest.TestCase):
         trimmed, stats = trim_papers_for_storage(payload, max_stored_papers=1, max_data_bytes=0)
         self.assertEqual([item["id"] for item in trimmed], ["newer-high"])
         self.assertEqual(stats["storage_trimmed_by_level"]["high"], 1)
+
+    def test_split_conference_payload_migrates_mixed_cache(self) -> None:
+        existing = {
+            "generated_at_iso": "2026-05-28T00:00:00+00:00",
+            "papers": [
+                {"id": "daily", "source": "arXiv"},
+                {"id": "conf", "source_type": "conference"},
+            ],
+        }
+
+        daily, conference = split_conference_payload(existing)
+
+        self.assertEqual([item["id"] for item in daily["papers"]], ["daily"])
+        self.assertEqual([item["id"] for item in conference["papers"]], ["conf"])
 
     def test_conference_years_default_to_recent_window(self) -> None:
         now = dt.datetime(2026, 5, 28, tzinfo=dt.timezone.utc)

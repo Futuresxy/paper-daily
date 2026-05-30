@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import copy
 import datetime as dt
+import difflib
 import email.utils
 import html
 import http.client
@@ -31,9 +32,12 @@ SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 DEFAULT_CONFIG = Path("config/interests.json")
 DEFAULT_OUTPUT = Path("web/data/papers.json")
+DEFAULT_CONFERENCE_OUTPUT = Path("web/data/conference_papers.json")
 RETAINED_MATCH_LEVELS = {"high", "medium"}
 DEFAULT_MAX_NEW_PAPERS = 50
 DEFAULT_MAX_STORED_PAPERS = 50
+DEFAULT_MAX_NEW_CONFERENCE_PAPERS = 50
+DEFAULT_MAX_STORED_CONFERENCE_PAPERS = 300
 DEFAULT_MAX_DATA_BYTES = 8 * 1024 * 1024
 DEFAULT_RECENT_HISTORY_DAYS = 45
 TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
@@ -404,37 +408,7 @@ def should_stop_arxiv_fetches(exc: Exception) -> bool:
     return isinstance(exc, urllib.error.HTTPError) and exc.code in {429, 503}
 
 
-def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
-    params = {
-        "search_query": arxiv_query_for_topic(topic),
-        "start": "0",
-        "max_results": str(max_results),
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    }
-    url = f"{ARXIV_API_URL}?{urllib.parse.urlencode(params)}"
-    retry_count = max(1, int(os.getenv("ARXIV_RETRIES", "4")))
-    timeout_seconds = float(os.getenv("ARXIV_TIMEOUT_SECONDS", "90"))
-    last_error: Exception | None = None
-    for attempt in range(retry_count):
-        req = urllib.request.Request(url, headers={"User-Agent": "paper-daily-collector/1.0 (+https://github.com/Futuresxy/paper-daily)"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-                xml_data = resp.read()
-            break
-        except Exception as exc:
-            last_error = exc
-            if not should_retry_arxiv_error(exc) or attempt == retry_count - 1:
-                raise
-            wait_seconds = arxiv_retry_wait_seconds(exc, attempt)
-            if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
-                print(f"arXiv rate limited {topic.name}, retrying in {wait_seconds:.0f}s", flush=True)
-            else:
-                print(f"arXiv temporary error for {topic.name}: {exc}; retrying in {wait_seconds:.0f}s", flush=True)
-            time.sleep(wait_seconds)
-    else:
-        raise RuntimeError(f"arXiv request failed: {last_error}")
-
+def parse_arxiv_entries(xml_data: bytes, seed_topic: str = "") -> list[dict[str, Any]]:
     root = ET.fromstring(xml_data)
     papers = []
     for entry in root.findall("atom:entry", ARXIV_NS):
@@ -469,10 +443,115 @@ def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
                 "paper_url": paper_id,
                 "pdf_url": pdf_url or paper_id.replace("/abs/", "/pdf/"),
                 "categories": categories,
-                "seed_topic": topic.id,
+                "seed_topic": seed_topic,
             }
         )
     return papers
+
+
+def fetch_arxiv_query(search_query: str, max_results: int, sort_by: str, sort_order: str, label: str) -> list[dict[str, Any]]:
+    params = {
+        "search_query": search_query,
+        "start": "0",
+        "max_results": str(max_results),
+        "sortBy": sort_by,
+        "sortOrder": sort_order,
+    }
+    url = f"{ARXIV_API_URL}?{urllib.parse.urlencode(params)}"
+    retry_count = max(1, int(os.getenv("ARXIV_RETRIES", "4")))
+    timeout_seconds = float(os.getenv("ARXIV_TIMEOUT_SECONDS", "90"))
+    last_error: Exception | None = None
+    for attempt in range(retry_count):
+        req = urllib.request.Request(url, headers={"User-Agent": "paper-daily-collector/1.0 (+https://github.com/Futuresxy/paper-daily)"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                xml_data = resp.read()
+            break
+        except Exception as exc:
+            last_error = exc
+            if not should_retry_arxiv_error(exc) or attempt == retry_count - 1:
+                raise
+            wait_seconds = arxiv_retry_wait_seconds(exc, attempt)
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+                print(f"arXiv rate limited {label}, retrying in {wait_seconds:.0f}s", flush=True)
+            else:
+                print(f"arXiv temporary error for {label}: {exc}; retrying in {wait_seconds:.0f}s", flush=True)
+            time.sleep(wait_seconds)
+    else:
+        raise RuntimeError(f"arXiv request failed: {last_error}")
+    return parse_arxiv_entries(xml_data)
+
+
+def fetch_arxiv(topic: Topic, max_results: int) -> list[dict[str, Any]]:
+    papers = fetch_arxiv_query(
+        arxiv_query_for_topic(topic),
+        max_results,
+        sort_by="submittedDate",
+        sort_order="descending",
+        label=topic.name,
+    )
+    for paper in papers:
+        paper["seed_topic"] = topic.id
+    return papers
+
+
+def title_match_key(title: str) -> str:
+    text = html.unescape(title).lower()
+    text = re.sub(r"\barxiv:\d{4}\.\d+(v\d+)?\b", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return normalize_space(text)
+
+
+def titles_match(left: str, right: str) -> bool:
+    left_key = title_match_key(left)
+    right_key = title_match_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    return difflib.SequenceMatcher(None, left_key, right_key).ratio() >= env_float("ARXIV_TITLE_MATCH_RATIO", 0.90)
+
+
+def arxiv_title_query(title: str) -> str:
+    safe_title = normalize_space(title).replace('"', " ")
+    if not safe_title:
+        return 'all:""'
+    # Exact title search first; arXiv still returns close matches when punctuation differs.
+    return f'ti:"{safe_title}"'
+
+
+def find_arxiv_by_title(title: str, max_results: int = 5) -> dict[str, Any] | None:
+    papers = fetch_arxiv_query(
+        arxiv_title_query(title),
+        max_results=max(1, max_results),
+        sort_by="relevance",
+        sort_order="descending",
+        label=f"title:{title[:80]}",
+    )
+    for candidate in papers:
+        if titles_match(title, str(candidate.get("title") or "")) and has_meaningful_summary(candidate):
+            return candidate
+    return None
+
+
+def enrich_conference_paper_from_arxiv(paper: dict[str, Any], arxiv_paper: dict[str, Any]) -> bool:
+    if not has_meaningful_summary(arxiv_paper):
+        return False
+    paper["summary"] = arxiv_paper["summary"]
+    paper["abstract_source"] = "arXiv"
+    paper["enriched"] = True
+    paper["arxiv_id"] = arxiv_paper.get("id", "")
+    paper["arxiv_url"] = arxiv_paper.get("paper_url", "")
+    paper["source"] = f"{paper.get('source', 'DBLP')} + arXiv"
+    if arxiv_paper.get("paper_url"):
+        paper["paper_url"] = arxiv_paper["paper_url"]
+    if arxiv_paper.get("pdf_url"):
+        paper["pdf_url"] = arxiv_paper["pdf_url"]
+    if arxiv_paper.get("authors"):
+        paper["authors"] = arxiv_paper["authors"]
+    categories = list(dict.fromkeys([*paper.get("categories", []), *arxiv_paper.get("categories", [])]))
+    paper["categories"] = [category for category in categories if category]
+    return True
 
 
 def dblp_retry_wait_seconds(exc: Exception, attempt: int) -> float:
@@ -1159,10 +1238,57 @@ def is_relevant_enough(paper: dict[str, Any], best_match: dict[str, Any]) -> boo
     return score >= env_float("MIN_PAPER_SCORE", 0.08)
 
 
+def enrich_conference_papers_from_arxiv(papers: list[dict[str, Any]]) -> dict[str, Any]:
+    max_enrichments = max(0, int(os.getenv("MAX_CONFERENCE_ARXIV_ENRICHMENTS", "50")))
+    delay_seconds = float(os.getenv("CONFERENCE_ARXIV_DELAY_SECONDS", "3"))
+    search_results = max(1, int(os.getenv("CONFERENCE_ARXIV_SEARCH_RESULTS", "5")))
+    stats: dict[str, Any] = {
+        "conference_arxiv_enrichment_attempted": 0,
+        "conference_arxiv_enrichment_succeeded": 0,
+        "conference_arxiv_enrichment_skipped": 0,
+        "conference_arxiv_enrichment_last_error": "",
+    }
+    if max_enrichments <= 0:
+        return stats
+
+    attempts = 0
+    for paper in papers:
+        if paper.get("source_type") != "conference" or has_meaningful_summary(paper):
+            continue
+        if attempts >= max_enrichments:
+            stats["conference_arxiv_enrichment_skipped"] += 1
+            continue
+        title = str(paper.get("title") or "")
+        if not title:
+            continue
+
+        attempts += 1
+        stats["conference_arxiv_enrichment_attempted"] += 1
+        try:
+            arxiv_paper = find_arxiv_by_title(title, max_results=search_results)
+        except Exception as exc:
+            stats["conference_arxiv_enrichment_last_error"] = str(exc)
+            print(f"Warning: arXiv title enrichment failed for {paper.get('id')}: {exc}", file=sys.stderr)
+            if should_stop_arxiv_fetches(exc):
+                break
+            arxiv_paper = None
+
+        if arxiv_paper and enrich_conference_paper_from_arxiv(paper, arxiv_paper):
+            stats["conference_arxiv_enrichment_succeeded"] += 1
+            print(f"Enriched conference paper from arXiv: {paper.get('title')}", flush=True)
+
+        if attempts < max_enrichments and delay_seconds > 0:
+            time.sleep(delay_seconds)
+    return stats
+
+
 def should_summarize_paper_with_llm(paper: dict[str, Any]) -> bool:
-    if paper.get("source_type") == "conference" and not env_flag("LLM_SUMMARIZE_CONFERENCE", False):
+    has_summary = has_meaningful_summary(paper)
+    if paper.get("source_type") == "conference" and not has_summary:
+        return env_flag("LLM_SUMMARIZE_CONFERENCE", False) and env_flag("LLM_SUMMARIZE_TITLE_ONLY", False)
+    if paper.get("source_type") == "conference" and not env_flag("LLM_SUMMARIZE_CONFERENCE", True):
         return False
-    if not has_meaningful_summary(paper) and not env_flag("LLM_SUMMARIZE_TITLE_ONLY", False):
+    if not has_summary and not env_flag("LLM_SUMMARIZE_TITLE_ONLY", False):
         return False
     return True
 
@@ -1170,13 +1296,13 @@ def should_summarize_paper_with_llm(paper: dict[str, Any]) -> bool:
 def fallback_summary(paper: dict[str, Any], best_match: dict[str, Any]) -> dict[str, str]:
     abstract = paper.get("summary", "")
     first_sentence = re.split(r"(?<=[.!?])\s+", abstract)[0] if abstract else ""
-    if paper.get("source_type") == "conference":
+    if paper.get("source_type") == "conference" and not has_meaningful_summary(paper):
         return {
-            "problem": "DBLP 只提供题录，当前不对会议论文做自动摘要。",
+            "problem": "DBLP 题录没有摘要，且未在 arXiv 找到足够可靠的同题论文摘要。",
             "method": "请打开论文链接查看方法和系统设计细节。",
-            "innovation": "仅凭标题无法可靠判断创新点，已避免占用 LLM 翻译额度。",
+            "innovation": "仅凭标题无法可靠判断创新点，已避免占用模型翻译额度。",
             "evidence": "题录信息来自会议索引，技术细节需要在原文中核验。",
-            "limitations": "DBLP 通常不提供摘要；部分 DOI 或出版社页面可能有访问限制。",
+            "limitations": "DBLP 通常不提供摘要；如果作者没有在 arXiv 发布预印本，自动摘要会缺失。",
             "why_relevant": best_match.get("reason", "与配置方向存在文本匹配。"),
         }
     if not has_meaningful_summary(paper):
@@ -1384,6 +1510,19 @@ def should_retain_conference_paper(
     return year in active_years_by_source.get(conference_id, set())
 
 
+def split_conference_payload(existing_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    daily_payload = copy.deepcopy(existing_payload) if isinstance(existing_payload, dict) else {}
+    conference_payload = copy.deepcopy(existing_payload) if isinstance(existing_payload, dict) else {}
+    papers = existing_payload.get("papers", []) if isinstance(existing_payload, dict) else []
+    daily_payload["papers"] = [
+        paper for paper in papers if isinstance(paper, dict) and paper.get("source_type") != "conference"
+    ]
+    conference_payload["papers"] = [
+        paper for paper in papers if isinstance(paper, dict) and paper.get("source_type") == "conference"
+    ]
+    return daily_payload, conference_payload
+
+
 def load_existing_payload(output_path: Path) -> dict[str, Any]:
     if not output_path.exists():
         return {}
@@ -1511,11 +1650,14 @@ def trim_papers_for_storage(
 def collect(
     config_path: Path,
     output_path: Path,
+    conference_output_path: Path,
     days: int,
     max_per_topic: int,
     max_summaries: int,
     max_new_papers: int,
     max_stored_papers: int,
+    max_new_conference_papers: int,
+    max_stored_conference_papers: int,
     max_data_bytes: int,
     incremental_since_last_run: bool,
     recent_history_days: int,
@@ -1528,8 +1670,14 @@ def collect(
     now = dt.datetime.now(dt.timezone.utc)
     conference_sources = parse_conference_sources(config, now)
     active_conference_years_by_source = active_conference_years(conference_sources)
-    existing_payload = {} if clear_cache else load_existing_payload(output_path)
-    cached_conference_years_by_source = cached_conference_years(existing_payload)
+    mixed_existing_payload = {} if clear_cache else load_existing_payload(output_path)
+    existing_payload, migrated_conference_payload = split_conference_payload(mixed_existing_payload)
+    stored_conference_payload = {} if clear_cache else load_existing_payload(conference_output_path)
+    if stored_conference_payload.get("papers"):
+        existing_conference_payload = stored_conference_payload
+    else:
+        existing_conference_payload = migrated_conference_payload
+    cached_conference_years_by_source = cached_conference_years(existing_conference_payload)
     cutoff, collection_mode = collection_cutoff(existing_payload, now, days, incremental_since_last_run)
     all_candidates = []
     successful_fetches = 0
@@ -1537,6 +1685,13 @@ def collect(
     successful_conference_fetches = 0
     failed_conference_fetches = 0
     skipped_cached_conference_years = 0
+    cached_conference_candidate_count = 0
+    conference_enrichment_stats: dict[str, Any] = {
+        "conference_arxiv_enrichment_attempted": 0,
+        "conference_arxiv_enrichment_succeeded": 0,
+        "conference_arxiv_enrichment_skipped": 0,
+        "conference_arxiv_enrichment_last_error": "",
+    }
     source_stats: dict[str, dict[str, Any]] = {}
     source_delay_seconds = float(os.getenv("SOURCE_DELAY_SECONDS", "3"))
     for source in sources:
@@ -1624,39 +1779,18 @@ def collect(
             source_stats[source.name]["last_error"] = str(exc)
             print(f"Warning: DBLP request failed for {source.name}: {exc}", file=sys.stderr)
 
-    if successful_fetches == 0 and failed_fetches > 0 and existing_payload:
-        existing = existing_payload
-        if existing.get("papers"):
-            print("All configured sources failed; preserving existing paper data.", file=sys.stderr)
-            retained_papers, retention_stats = merge_with_retained_papers(
-                [], existing_payload, now, recent_history_days, active_conference_years_by_source
-            )
-            retained_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
-            existing["papers"] = retained_papers
-            existing["generated_at"] = email.utils.format_datetime(now)
-            existing["generated_at_iso"] = now.isoformat()
-            existing_stats = existing.setdefault("stats", {})
-            existing_stats.update(
-                {
-                    "last_error": "All configured paper sources failed.",
-                    "successful_fetches": successful_fetches,
-                    "failed_fetches": failed_fetches,
-                    "source_stats": source_stats,
-                    "successful_conference_fetches": successful_conference_fetches,
-                    "failed_conference_fetches": failed_conference_fetches,
-                    "skipped_cached_conference_years": skipped_cached_conference_years,
-                    "conference_source_count": len(conference_sources),
-                    **retention_stats,
-                }
-            )
-            trimmed_papers, storage_stats = trim_papers_for_storage(existing, max_stored_papers, max_data_bytes)
-            trimmed_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
-            existing["papers"] = trimmed_papers
-            existing_stats.update(storage_stats)
-            existing_stats["paper_count"] = len(trimmed_papers)
-            existing_stats["data_bytes"] = json_size_bytes(existing)
-            write_json(output_path, existing)
-            return existing
+    for cached_paper in existing_conference_payload.get("papers", []) if isinstance(existing_conference_payload, dict) else []:
+        if not isinstance(cached_paper, dict) or cached_paper.get("source_type") != "conference":
+            continue
+        if not should_retain_conference_paper(cached_paper, active_conference_years_by_source):
+            continue
+        if has_meaningful_summary(cached_paper):
+            continue
+        all_candidates.append(copy.deepcopy(cached_paper))
+        cached_conference_candidate_count += 1
+
+    if successful_fetches == 0 and failed_fetches > 0 and (existing_payload.get("papers") or existing_conference_payload.get("papers")):
+        print("All configured sources failed; preserving existing paper data.", file=sys.stderr)
 
     recent_papers = []
     filtered_low_relevance = 0
@@ -1676,9 +1810,28 @@ def collect(
             recent_papers.append(paper)
 
     recent_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+    daily_recent_papers = [paper for paper in recent_papers if paper.get("source_type") != "conference"]
+    conference_recent_papers = [paper for paper in recent_papers if paper.get("source_type") == "conference"]
     candidate_paper_count = len(recent_papers)
+    daily_candidate_paper_count = len(daily_recent_papers)
+    conference_candidate_paper_count = len(conference_recent_papers)
     if max_new_papers > 0:
-        recent_papers = recent_papers[:max_new_papers]
+        daily_recent_papers = daily_recent_papers[:max_new_papers]
+    if max_new_conference_papers > 0:
+        conference_recent_papers = conference_recent_papers[:max_new_conference_papers]
+    conference_enrichment_stats = enrich_conference_papers_from_arxiv(conference_recent_papers)
+    if conference_enrichment_stats["conference_arxiv_enrichment_succeeded"]:
+        for paper in conference_recent_papers:
+            matches = [score_paper(topic, paper) for topic in topics]
+            matches.sort(key=lambda item: item["score"], reverse=True)
+            paper["matches"] = matches
+            paper["best_match"] = matches[0]
+        conference_recent_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+    recent_papers = sorted(
+        [*daily_recent_papers, *conference_recent_papers],
+        key=lambda p: (p["best_match"]["score"], p.get("published", "")),
+        reverse=True,
+    )
     summaries_by_id: dict[str, tuple[dict[str, str], dict[str, Any]]] = {}
     llm_jobs = []
     for paper in recent_papers[:max_summaries]:
@@ -1711,41 +1864,61 @@ def collect(
         else:
             paper["chinese_summary"] = fallback_summary(paper, paper["best_match"])
 
-    merged_papers, retention_stats = merge_with_retained_papers(
-        recent_papers, existing_payload, now, recent_history_days, active_conference_years_by_source
+    daily_recent_papers = [paper for paper in recent_papers if paper.get("source_type") != "conference"]
+    conference_recent_papers = [paper for paper in recent_papers if paper.get("source_type") == "conference"]
+    daily_merged_papers, daily_retention_stats = merge_with_retained_papers(
+        daily_recent_papers, existing_payload, now, recent_history_days
     )
-    merged_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+    conference_merged_papers, conference_retention_stats = merge_with_retained_papers(
+        conference_recent_papers,
+        existing_conference_payload,
+        now,
+        recent_history_days,
+        active_conference_years_by_source,
+    )
+    daily_merged_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+    conference_merged_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+
+    base_stats = {
+        "candidate_paper_count": candidate_paper_count,
+        "daily_candidate_paper_count": daily_candidate_paper_count,
+        "conference_candidate_paper_count": conference_candidate_paper_count,
+        "filtered_low_relevance_count": filtered_low_relevance,
+        "days": days,
+        "collection_mode": collection_mode,
+        "collection_cutoff_iso": cutoff.isoformat(),
+        "max_per_topic": max_per_topic,
+        "max_new_papers": max_new_papers,
+        "max_new_conference_papers": max_new_conference_papers,
+        "sources": [source.__dict__ for source in sources],
+        "conference_sources": [source.__dict__ for source in conference_sources],
+        "source_stats": source_stats,
+        "llm_enabled": llm_enabled(),
+        "llm_concurrency": int(os.getenv("LLM_CONCURRENCY", "2")),
+        "recent_history_days": recent_history_days,
+        "successful_fetches": successful_fetches,
+        "failed_fetches": failed_fetches,
+        "successful_conference_fetches": successful_conference_fetches,
+        "failed_conference_fetches": failed_conference_fetches,
+        "skipped_cached_conference_years": skipped_cached_conference_years,
+        "conference_source_count": len(conference_sources),
+        "cached_conference_candidate_count": cached_conference_candidate_count,
+        "clear_cache": clear_cache,
+        **conference_enrichment_stats,
+    }
 
     payload = {
         "generated_at": email.utils.format_datetime(now),
         "generated_at_iso": now.isoformat(),
         "config_source": "issue" if config is not default_config else "file",
+        "data_kind": "daily",
         "topics": [topic.__dict__ for topic in topics],
-        "papers": merged_papers,
+        "papers": daily_merged_papers,
         "stats": {
-            "paper_count": len(merged_papers),
-            "new_paper_count": len(recent_papers),
-            "candidate_paper_count": candidate_paper_count,
-            "filtered_low_relevance_count": filtered_low_relevance,
-            "days": days,
-            "collection_mode": collection_mode,
-            "collection_cutoff_iso": cutoff.isoformat(),
-            "max_per_topic": max_per_topic,
-            "max_new_papers": max_new_papers,
-            "sources": [source.__dict__ for source in sources],
-            "conference_sources": [source.__dict__ for source in conference_sources],
-            "source_stats": source_stats,
-            "llm_enabled": llm_enabled(),
-            "llm_concurrency": int(os.getenv("LLM_CONCURRENCY", "2")),
-            "recent_history_days": recent_history_days,
-            "successful_fetches": successful_fetches,
-            "failed_fetches": failed_fetches,
-            "successful_conference_fetches": successful_conference_fetches,
-            "failed_conference_fetches": failed_conference_fetches,
-            "skipped_cached_conference_years": skipped_cached_conference_years,
-            "conference_source_count": len(conference_sources),
-            "clear_cache": clear_cache,
-            **retention_stats,
+            **base_stats,
+            "paper_count": len(daily_merged_papers),
+            "new_paper_count": len(daily_recent_papers),
+            **daily_retention_stats,
         },
     }
     trimmed_papers, storage_stats = trim_papers_for_storage(payload, max_stored_papers, max_data_bytes)
@@ -1755,6 +1928,32 @@ def collect(
     payload["stats"]["paper_count"] = len(trimmed_papers)
     payload["stats"]["data_bytes"] = json_size_bytes(payload)
     write_json(output_path, payload)
+
+    conference_payload = {
+        "generated_at": email.utils.format_datetime(now),
+        "generated_at_iso": now.isoformat(),
+        "config_source": "issue" if config is not default_config else "file",
+        "data_kind": "conference",
+        "topics": [topic.__dict__ for topic in topics],
+        "papers": conference_merged_papers,
+        "stats": {
+            **base_stats,
+            "paper_count": len(conference_merged_papers),
+            "new_paper_count": len(conference_recent_papers),
+            **conference_retention_stats,
+        },
+    }
+    conference_trimmed_papers, conference_storage_stats = trim_papers_for_storage(
+        conference_payload,
+        max_stored_conference_papers,
+        max_data_bytes,
+    )
+    conference_trimmed_papers.sort(key=lambda p: (p["best_match"]["score"], p.get("published", "")), reverse=True)
+    conference_payload["papers"] = conference_trimmed_papers
+    conference_payload["stats"].update(conference_storage_stats)
+    conference_payload["stats"]["paper_count"] = len(conference_trimmed_papers)
+    conference_payload["stats"]["data_bytes"] = json_size_bytes(conference_payload)
+    write_json(conference_output_path, conference_payload)
     return payload
 
 
@@ -1762,11 +1961,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Collect papers and build static data for paper-daily.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--conference-output", type=Path, default=Path(os.getenv("CONFERENCE_OUTPUT", str(DEFAULT_CONFERENCE_OUTPUT))))
     parser.add_argument("--days", type=int, default=int(os.getenv("LOOKBACK_DAYS", "7")))
     parser.add_argument("--max-per-topic", type=int, default=int(os.getenv("MAX_PER_TOPIC", "25")))
     parser.add_argument("--max-summaries", type=int, default=int(os.getenv("MAX_SUMMARIES", "40")))
     parser.add_argument("--max-new-papers", type=int, default=int(os.getenv("MAX_NEW_PAPERS", str(DEFAULT_MAX_NEW_PAPERS))))
     parser.add_argument("--max-stored-papers", type=int, default=int(os.getenv("MAX_STORED_PAPERS", str(DEFAULT_MAX_STORED_PAPERS))))
+    parser.add_argument(
+        "--max-new-conference-papers",
+        type=int,
+        default=int(os.getenv("MAX_NEW_CONFERENCE_PAPERS", str(DEFAULT_MAX_NEW_CONFERENCE_PAPERS))),
+    )
+    parser.add_argument(
+        "--max-stored-conference-papers",
+        type=int,
+        default=int(os.getenv("MAX_STORED_CONFERENCE_PAPERS", str(DEFAULT_MAX_STORED_CONFERENCE_PAPERS))),
+    )
     parser.add_argument("--max-data-bytes", type=int, default=int(os.getenv("MAX_DATA_BYTES", str(DEFAULT_MAX_DATA_BYTES))))
     parser.add_argument("--incremental-since-last-run", action="store_true", default=env_flag("INCREMENTAL_SINCE_LAST_RUN"))
     parser.add_argument("--recent-history-days", type=int, default=int(os.getenv("RECENT_HISTORY_DAYS", str(DEFAULT_RECENT_HISTORY_DAYS))))
@@ -1775,17 +1985,23 @@ def main() -> None:
     payload = collect(
         args.config,
         args.output,
+        args.conference_output,
         args.days,
         args.max_per_topic,
         args.max_summaries,
         args.max_new_papers,
         args.max_stored_papers,
+        args.max_new_conference_papers,
+        args.max_stored_conference_papers,
         args.max_data_bytes,
         args.incremental_since_last_run,
         args.recent_history_days,
         args.clear_cache,
     )
-    print(f"Wrote {len(payload['papers'])} papers to {args.output}")
+    print(f"Wrote {len(payload['papers'])} daily papers to {args.output}")
+    if args.conference_output.exists():
+        conference_payload = load_json(args.conference_output)
+        print(f"Wrote {len(conference_payload.get('papers', []))} conference papers to {args.conference_output}")
 
 
 if __name__ == "__main__":

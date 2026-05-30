@@ -2,12 +2,16 @@ const THEME_STORAGE_KEY = "paper-daily-theme";
 const THEMES = new Set(["dark", "light", "eye"]);
 
 const state = {
-  data: null,
+  datasets: {
+    daily: null,
+    conference: null,
+  },
   theme: "dark",
   filters: {
     query: "",
     topic: "all",
     level: "all",
+    collection: "daily",
     view: "daily",
     date: "",
   },
@@ -29,9 +33,14 @@ const nodes = {
   dateFilter: document.querySelector("#dateFilter"),
   searchInput: document.querySelector("#searchInput"),
   themeOptions: document.querySelectorAll("[data-theme-option]"),
+  collectionTabs: document.querySelectorAll("[data-collection]"),
   tabs: document.querySelectorAll(".tab"),
   template: document.querySelector("#paperTemplate"),
 };
+
+function activeData() {
+  return state.datasets[state.filters.collection] || state.datasets.daily || { papers: [], topics: [], stats: {} };
+}
 
 function storedTheme() {
   try {
@@ -148,6 +157,7 @@ function matchesBaseFilters(paper) {
 }
 
 function matchesView(paper) {
+  if (state.filters.view === "all") return true;
   const date = selectedDate();
   const collectedAt = collectionTime(paper);
   if (state.filters.view === "daily") return dateKey(collectedAt) === state.filters.date;
@@ -160,7 +170,7 @@ function matchesView(paper) {
 }
 
 function filteredPapers() {
-  return (state.data?.papers || [])
+  return (activeData().papers || [])
     .filter((paper) => matchesBaseFilters(paper) && matchesView(paper))
     .sort((a, b) => scoreOf(b) - scoreOf(a) || String(b.published || "").localeCompare(String(a.published || "")));
 }
@@ -228,6 +238,7 @@ function viewLabels() {
   const weekEnd = formatDate(weekEndDate.toISOString());
   const monthLabel = `${date.getFullYear()} 年 ${String(date.getMonth() + 1).padStart(2, "0")} 月`;
   return {
+    all: [state.filters.collection === "conference" ? "顶会精品" : "全部论文", "全部已收录论文"],
     daily: ["当日论文", dayLabel],
     week: ["本周论文", `${weekStart} - ${weekEnd}`],
     month: ["月度论文", monthLabel],
@@ -263,7 +274,7 @@ function render() {
 
 function hydrateTopicFilter() {
   nodes.topicFilter.innerHTML = '<option value="all">全部方向</option>';
-  for (const topic of state.data.topics || []) {
+  for (const topic of activeData().topics || []) {
     const option = document.createElement("option");
     option.value = topic.id;
     option.textContent = topic.name;
@@ -272,8 +283,9 @@ function hydrateTopicFilter() {
 }
 
 function hydrateDateFilter() {
-  const dates = [...new Set((state.data.papers || []).map((paper) => dateKey(collectionTime(paper))).filter(Boolean))].sort().reverse();
-  const fallback = dateKey(state.data.generated_at_iso || new Date().toISOString());
+  const data = activeData();
+  const dates = [...new Set((data.papers || []).map((paper) => dateKey(collectionTime(paper))).filter(Boolean))].sort().reverse();
+  const fallback = dateKey(data.generated_at_iso || new Date().toISOString());
   const options = dates.length ? dates : [fallback];
   state.filters.date = options[0];
   nodes.dateFilter.textContent = "";
@@ -286,7 +298,7 @@ function hydrateDateFilter() {
 }
 
 function updateStats() {
-  const papers = state.data.papers || [];
+  const papers = activeData().papers || [];
   const date = selectedDate();
   const weekPapers = papers.filter((paper) => inRange(collectionTime(paper), startOfWeek(date), endOfWeek(date)));
   const monthPapers = papers.filter((paper) => inRange(collectionTime(paper), startOfMonth(date), endOfMonth(date)));
@@ -315,6 +327,20 @@ function bindEvents() {
     state.filters.level = event.target.value;
     render();
   });
+  for (const tab of nodes.collectionTabs) {
+    tab.addEventListener("click", () => {
+      state.filters.collection = tab.dataset.collection;
+      state.filters.view = state.filters.collection === "conference" ? "all" : "daily";
+      state.filters.topic = "all";
+      for (const item of nodes.collectionTabs) item.classList.toggle("active", item === tab);
+      for (const item of nodes.tabs) item.classList.toggle("active", item.dataset.view === state.filters.view);
+      hydrateTopicFilter();
+      hydrateDateFilter();
+      updateStats();
+      updateUpdatedAt();
+      render();
+    });
+  }
   nodes.dateFilter.addEventListener("change", (event) => {
     state.filters.date = event.target.value;
     updateStats();
@@ -335,24 +361,47 @@ async function loadData() {
   return response.json();
 }
 
+async function loadOptionalData(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) return { generated_at_iso: new Date().toISOString(), topics: [], papers: [], stats: {} };
+  return response.json();
+}
+
+function updateUpdatedAt(message = "") {
+  if (message) {
+    nodes.updatedAt.textContent = message;
+    return;
+  }
+  const data = activeData();
+  const stats = data.stats || {};
+  const mode = stats.collection_mode === "incremental" ? "增量" : "初始化";
+  const kind = state.filters.collection === "conference" ? "顶会精品" : "每日新论文";
+  nodes.updatedAt.textContent = `${kind} · 更新于 ${formatDate(data.generated_at_iso)} · ${mode} · ${stats.llm_enabled ? "LLM" : "基础"}`;
+}
+
 async function main() {
   applyTheme(storedTheme());
   bindEvents();
   try {
-    state.data = await loadData();
+    state.datasets.daily = await loadData();
+    state.datasets.conference = await loadOptionalData("./data/conference_papers.json");
   } catch (error) {
-    state.data = {
+    state.datasets.daily = {
       generated_at_iso: new Date().toISOString(),
       topics: [],
       papers: [],
       stats: { llm_enabled: false },
     };
-    nodes.updatedAt.textContent = `数据读取失败：${error.message}`;
+    state.datasets.conference = {
+      generated_at_iso: new Date().toISOString(),
+      topics: [],
+      papers: [],
+      stats: { llm_enabled: false },
+    };
+    updateUpdatedAt(`数据读取失败：${error.message}`);
   }
 
-  const stats = state.data.stats || {};
-  const mode = stats.collection_mode === "incremental" ? "增量" : "初始化";
-  nodes.updatedAt.textContent = `更新于 ${formatDate(state.data.generated_at_iso)} · ${mode} · ${stats.llm_enabled ? "LLM" : "基础"}`;
+  updateUpdatedAt();
   hydrateTopicFilter();
   hydrateDateFilter();
   updateStats();

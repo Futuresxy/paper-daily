@@ -56,6 +56,8 @@ jobs:
           MAX_SUMMARIES: ${{ vars.MAX_SUMMARIES || '20' }}
           MAX_NEW_PAPERS: ${{ vars.MAX_NEW_PAPERS || '50' }}
           MAX_STORED_PAPERS: ${{ vars.MAX_STORED_PAPERS || '50' }}
+          MAX_NEW_CONFERENCE_PAPERS: ${{ vars.MAX_NEW_CONFERENCE_PAPERS || '50' }}
+          MAX_STORED_CONFERENCE_PAPERS: ${{ vars.MAX_STORED_CONFERENCE_PAPERS || '300' }}
           MAX_DATA_BYTES: ${{ vars.MAX_DATA_BYTES || '8388608' }}
           RECENT_HISTORY_DAYS: ${{ vars.RECENT_HISTORY_DAYS || '45' }}
           PAPER_SOURCES: ${{ vars.PAPER_SOURCES || '' }}
@@ -67,6 +69,9 @@ jobs:
           DBLP_PATTERN_DELAY_SECONDS: ${{ vars.DBLP_PATTERN_DELAY_SECONDS || '3' }}
           DBLP_RETRIES: ${{ vars.DBLP_RETRIES || '3' }}
           MAX_PER_CONFERENCE: ${{ vars.MAX_PER_CONFERENCE || '1000' }}
+          MAX_CONFERENCE_ARXIV_ENRICHMENTS: ${{ vars.MAX_CONFERENCE_ARXIV_ENRICHMENTS || '50' }}
+          CONFERENCE_ARXIV_DELAY_SECONDS: ${{ vars.CONFERENCE_ARXIV_DELAY_SECONDS || '3' }}
+          CONFERENCE_ARXIV_SEARCH_RESULTS: ${{ vars.CONFERENCE_ARXIV_SEARCH_RESULTS || '5' }}
           SEMANTIC_SCHOLAR_API_KEY: ${{ secrets.SEMANTIC_SCHOLAR_API_KEY }}
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
           CUSTOM_FEED_HEADERS: ${{ secrets.CUSTOM_FEED_HEADERS }}
@@ -85,8 +90,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- web/data/papers.json; then
-            git add web/data/papers.json
+          if [ -n "$(git status --porcelain -- web/data/papers.json web/data/conference_papers.json)" ]; then
+            git add web/data/papers.json web/data/conference_papers.json
             git commit -m "Update paper data [skip ci]"
             git push origin HEAD:main
           fi
